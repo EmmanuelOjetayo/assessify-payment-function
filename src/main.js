@@ -1,29 +1,47 @@
 import { Client, Databases, Query } from 'node-appwrite';
 
-/**
- * Assessify License Processor
- * Triggered by Flutterwave Webhook
- */
 export default async ({ req, res, log, error }) => {
-  // 1. Security Verification
+  // 1. Parse the Payload (Handles string, object, or Webhook JSON)
+  let payload;
+  try {
+    payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+  } catch (e) {
+    payload = req.body;
+  }
+
+  // 2. Identify Trigger Source & Security
   const flwHeader = req.headers['verif-hash'];
   const secretHash = process.env.FLW_SECRET_HASH;
+  const isManual = !flwHeader;
 
-  if (!flwHeader || flwHeader !== secretHash) {
-    error('Unauthorized: Signature mismatch or missing hash');
-    return res.json({ success: false, message: 'Unauthorized' }, 401);
+  if (!isManual) {
+    // Webhook Security Check
+    if (flwHeader !== secretHash) {
+      error('Unauthorized: Signature mismatch from Flutterwave');
+      return res.json({ success: false, message: 'Unauthorized' }, 401);
+    }
+  } else {
+    log('Processing Manual Trigger from Assessify React App...');
   }
 
-  // 2. Extract Data from Flutterwave Body
-  const payload = req.body;
+  // 3. Extract Key Data
+  // Handles React payload { schoolCode, plan } or FLW payload { meta: { schoolCode }, amount }
+  const schoolCode = payload.schoolCode || payload.meta?.schoolCode;
+  let amountPaid = payload.amount || payload.meta?.amount;
 
-  // We only act on 'successful' status
-  if (payload.status !== 'successful') {
-    log(`Transaction ignored with status: ${payload.status}`);
-    return res.json({ message: 'Transaction not successful, no action taken.' }, 200);
+  // If amount is missing (Manual trigger), infer it from the plan name
+  if (!amountPaid && payload.plan) {
+    amountPaid = payload.plan === 'Sessional' ? 50000 : 20000;
   }
 
-  // 3. Initialize Appwrite SDK
+  if (!schoolCode) {
+    error('Metadata Error: schoolCode is missing from payload.');
+    return res.json({ success: false, message: 'Missing schoolCode' }, 400);
+  }
+
+  log(`Payload Verified: School: ${schoolCode}, Amount detected: ₦${amountPaid}`);
+
+  // 4. Initialize SDK
   const client = new Client()
     .setEndpoint(process.env.APPWRITE_FUNCTION_ENDPOINT)
     .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
@@ -31,17 +49,8 @@ export default async ({ req, res, log, error }) => {
 
   const databases = new Databases(client);
 
-  // Retrieve Metadata from payment
-  const schoolCode = payload.meta?.schoolCode;
-  const amountPaid = payload.amount;
-
-  if (!schoolCode) {
-    error('Metadata Error: schoolCode is missing from the transaction meta.');
-    return res.json({ success: false, message: 'Missing schoolCode' }, 400);
-  }
-
   try {
-    // 4. Locate the School Record
+    // 5. Locate School Record in Cloud
     const response = await databases.listDocuments(
       process.env.DATABASE_ID,
       process.env.COLLECTION_ID,
@@ -49,33 +58,36 @@ export default async ({ req, res, log, error }) => {
     );
 
     if (response.total === 0) {
-      error(`Database Error: No license record found for school: ${schoolCode}`);
-      return res.json({ success: false, message: 'School not found' }, 404);
+      error(`Database Error: No record found for school: ${schoolCode}`);
+      return res.json({ success: false, message: 'School record not found' }, 404);
     }
 
     const document = response.documents[0];
     const currentExpiry = new Date(document.expiryDate);
     
-    // Logic: Start from "Now" or "Existing Expiry" (whichever is further)
-    // This prevents schools from losing days if they renew early.
-    const baseDate = currentExpiry > new Date() ? currentExpiry : new Date();
+    // Safety: Start from "Now" or "Current Expiry" (whichever is further)
+    // This ensures users don't lose days if they renew early.
+    const baseDate = (currentExpiry > new Date()) ? currentExpiry : new Date();
     let newExpiry = new Date(baseDate);
 
-    // 5. Calculate Duration based on Plan
-    // (Note: Flutterwave amounts are checked against your 20k/50k logic)
+    // 6. Calculate Extension Logic (Explicit else if)
     if (amountPaid >= 50000) {
-      newExpiry.setFullYear(newExpiry.getFullYear() + 1); // +1 Year
-      log(`Processing SESSIONAL plan for ${schoolCode}`);
-    } else if (amountPaid >= 20000) {
-      newExpiry.setMonth(newExpiry.getMonth() + 4); // +4 Months (One Term)
-      log(`Processing TERMLY plan for ${schoolCode}`);
-    } else {
-      // Default safety: if amount is lower, give 1 month
+      // Sessional Plan: Add 1 Year
+      newExpiry.setFullYear(newExpiry.getFullYear() + 1);
+      log(`Plan: SESSIONAL detected. Extending 1 year for ${schoolCode}`);
+    } 
+    else if (amountPaid >= 20000) {
+      // Termly Plan: Add 4 Months
+      newExpiry.setMonth(newExpiry.getMonth() + 4);
+      log(`Plan: TERMLY detected. Extending 4 months for ${schoolCode}`);
+    } 
+    else {
+      // Fallback: If amount is somehow lower, give 1 month
       newExpiry.setMonth(newExpiry.getMonth() + 1);
-      log(`Processing DEFAULT (1 month) plan for ${schoolCode}`);
+      log(`Plan: MINIMUM/PROMO detected. Extending 1 month for ${schoolCode}`);
     }
 
-    // 6. Update the Cloud Database
+    // 7. Update the Cloud Database
     await databases.updateDocument(
       process.env.DATABASE_ID,
       process.env.COLLECTION_ID,
@@ -90,12 +102,13 @@ export default async ({ req, res, log, error }) => {
     
     return res.json({ 
       success: true, 
-      school: schoolCode, 
-      expiry: newExpiry.toISOString() 
+      school: schoolCode,
+      newExpiry: newExpiry.toISOString(),
+      message: 'License successfully updated'
     }, 200);
 
   } catch (err) {
-    error(`System Error: ${err.message}`);
-    return res.json({ success: false, error: 'Internal Server Error' }, 500);
+    error(`System Error during processing: ${err.message}`);
+    return res.json({ success: false, error: err.message }, 500);
   }
 };

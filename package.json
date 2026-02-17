@@ -1,0 +1,25 @@
+{
+  "name": "assessify-license-processor",
+  "version": "1.0.0",
+  "description": "Flutterwave webhook handler for Assessify Hybrid Security Engine",
+  "main": "src/main.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.js"
+  },
+  "keywords": [
+    "appwrite",
+    "flutterwave",
+    "webhook",
+    "assessify"
+  ],
+  "author": "Assessify Dev Team",
+  "license": "ISC",
+  "dependencies": {
+    "node-appwrite": "^14.1.0"
+  },
+  "devDependencies": {},
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
